@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import csv
 import io
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
+from app.services.export_guard import export_guard
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
+
+# 单次吐出的 CSV 文本达到该阈值就冲刷给客户端，避免整份文件占住内存。
+EXPORT_CHUNK_BYTES = 64 * 1024
 
 
 def require_service(module: str):
@@ -41,6 +46,32 @@ def list_entries(
     return PageResult(items=items, total=total, page=page, size=size)
 
 
+def _csv_chunks(service, items: list[dict[str, Any]]) -> Iterator[str]:
+    """逐行生成 CSV 文本块。
+
+    表头、字段顺序、公式转义与记录顺序和原一次性拼装完全一致，
+    但每攒够一个块就交出，三十万行也不会把全量文本留在内存。
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    buffer.write("\ufeff")
+    writer.writerow(["id", *service.LIST_FIELDS, "status"])
+    for item in items:
+        values = [item.get("id"), *(item.get(field, "") for field in service.LIST_FIELDS),
+                  item.get("status", "")]
+        writer.writerow([
+            "'" + str(value) if str(value or "").startswith(("=", "+", "-", "@")) else value
+            for value in values
+        ])
+        if buffer.tell() >= EXPORT_CHUNK_BYTES:
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+    tail = buffer.getvalue()
+    if tail:
+        yield tail
+
+
 @router.get("/{module}/export")
 def export_entries(
     module: str,
@@ -54,21 +85,22 @@ def export_entries(
         for key, value in request.query_params.items()
         if key in service.LIST_FIELDS and value.strip()
     }
-    items, _ = service.list_entries(
-        filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
-    output = io.StringIO()
-    output.write("\ufeff")
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(["id", *service.LIST_FIELDS, "status"])
-    for item in items:
-        values = [item.get("id"), *(item.get(field, "") for field in service.LIST_FIELDS),
-                  item.get("status", "")]
-        writer.writerow([
-            "'" + str(value) if str(value or "").startswith(("=", "+", "-", "@")) else value
-            for value in values
-        ])
+    # 快照只持有行引用：首块立即开始下载，且导出期间清理任务不会
+    # 让本次传输中途少行或重复。
+    items = service.snapshot_entries(filters=filters, keyword=keyword, status=status)
+    hold = export_guard.acquire(service.MODULE, (row.get("id", 0) for row in items))
+
+    async def stream():
+        try:
+            async for chunk in iterate_in_threadpool(_csv_chunks(service, items)):
+                yield chunk
+        finally:
+            # 正常发完、客户端断开或生成器被关闭都会走到这里，
+            # 已结束的请求不会继续占住待清理的批次。
+            export_guard.release(hold)
+
     return StreamingResponse(
-        iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
+        stream(), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{module}.csv"'},
     )
 

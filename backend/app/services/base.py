@@ -15,16 +15,14 @@ class BaseModuleService:
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
 
-    def list_entries(
+    def _filter_rows(
         self,
+        rows: list[dict[str, Any]],
         *,
         filters: dict[str, str] | None = None,
         keyword: str | None = None,
         status: str | None = None,
-        page: int = 1,
-        size: int = 20,
-    ) -> tuple[list[dict[str, Any]], int]:
-        rows = list(store.rows(self.MODULE))
+    ) -> list[dict[str, Any]]:
         for field, expected in (filters or {}).items():
             if field in self.LIST_FIELDS:
                 rows = [
@@ -36,9 +34,39 @@ class BaseModuleService:
             rows = [row for row in rows if keyword.casefold() in str(row.get(field, "")).casefold()]
         if status:
             rows = [row for row in rows if row.get("status") == status]
+        return rows
+
+    def list_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows = self._filter_rows(
+            list(store.rows(self.MODULE)),
+            filters=filters, keyword=keyword, status=status)
         total = len(rows)
         start = (page - 1) * size
         return rows[start:start + size], total
+
+    def snapshot_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """导出快照：筛选和记录顺序与列表接口一致，但不分页。
+
+        只复制行引用、不复制行内容，导出期间清理任务增删行不会影响
+        本次快照，保证传输中的 CSV 不多行、不少行。
+        """
+        return self._filter_rows(
+            list(store.rows(self.MODULE)),
+            filters=filters, keyword=keyword, status=status)
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
         return store.find(self.MODULE, entry_id)

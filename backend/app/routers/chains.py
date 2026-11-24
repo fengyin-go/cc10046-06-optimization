@@ -148,6 +148,19 @@ def run_auth(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@router.post("/cleanup-scan")
+def run_cleanup_scan(payload: dict[str, Any]) -> dict[str, Any]:
+    """清理扫描：按保留期限回收归档批次，返回已回收/仍待回收报表。"""
+    import time
+    task_id = payload.get("task_id") or f"CLEANUP-SCAN-{int(time.time())}"
+    target_module = payload.get("target_module", "result_store")
+    retention_days = int(payload.get("retention_days", 30))
+    cleanup_type = payload.get("cleanup_type", "soft")
+
+    report = _cleanup.domain_cleanup(task_id, target_module, retention_days, cleanup_type)
+    return {"chain": "cleanup-scan", "report": report}
+
+
 @router.post("/delivery")
 def run_delivery(payload: dict[str, Any]) -> dict[str, Any]:
     """交付链路：结果存储 → 导出 → 审计 → 数据清理。"""
